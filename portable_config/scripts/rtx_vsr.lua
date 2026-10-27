@@ -1,9 +1,9 @@
 --[[
   @name NVIDIA RTX Video Super Resolution (VSR)
-  @description Dynamically manages native D3D11 NVIDIA RTX Video Super Resolution (@rtx_vsr:d3d11vpp)
-               at Quality Level 4 (Ultra) via NVAPI for sub-native streams while preserving aspect
-               ratios and coordinating with Shift+R direct vf toggle, Anime4K shaders, SVP, and CPU filters.
-  @version 1.2
+  @description Dynamically manages native D3D11 NVIDIA RTX Video Super Resolution (@rtx_vsr:d3d11vpp=scaling-mode=nvidia)
+               for sub-native streams with quality controlled natively by the NVIDIA driver (Control Panel / NVIDIA App)
+               while preserving aspect ratios and coordinating with Shift+R clean OSD toggle, Anime4K shaders, SVP, and CPU filters.
+  @version 1.3
   @author Stremio-Kai
 --]]
 -- luacheck: read globals mp
@@ -11,7 +11,6 @@
 local mp = require("mp")
 
 local FILTER_LABEL = "rtx_vsr"
-local VSR_TARGET_QUALITY = 4 -- Quality 4 (Ultra / Max Quality)
 
 local state = {
     user_enabled = true,
@@ -19,8 +18,6 @@ local state = {
     force_over_anime4k = false,
     active = false,
     current_scale_str = nil,
-    current_quality = VSR_TARGET_QUALITY,
-    nvapi_quality_enforced = false,
     last_reason = "Initializing",
     internal_vf_op = false,
     internal_shader_op = false,
@@ -47,117 +44,10 @@ local function is_headless()
     return false
 end
 
--- Enforce NVIDIA RTX VSR Quality Level 4 (Ultra) directly in the NVIDIA driver via NVAPI (LuaJIT FFI)
-local nvapi_ctx = nil
-
-local function init_nvapi()
-    if nvapi_ctx ~= nil then
-        return nvapi_ctx
-    end
-
-    local ok, ctx = pcall(function()
-        local ffi = require("ffi")
-        ffi.cdef[[
-            void* nvapi_QueryInterface(uint32_t id);
-            typedef int (*NvAPI_Initialize_t)(void);
-            typedef int (*NvAPI_EnumNvidiaDisplayHandle_t)(uint32_t thisEnum, void** pNvDispHandle);
-            typedef int (*NvAPI_GetVideoState_t)(void* hNvDisplay, void* pGetComp);
-            typedef int (*NvAPI_SetVideoState_t)(void* hNvDisplay, void* pSetComp);
-            int __stdcall GetSystemMetrics(int nIndex);
-        ]]
-
-        local nvapi = ffi.load("nvapi64.dll")
-        local init_fn = ffi.cast("NvAPI_Initialize_t", nvapi.nvapi_QueryInterface(0x0150E828))
-        local enum_disp_fn = ffi.cast("NvAPI_EnumNvidiaDisplayHandle_t", nvapi.nvapi_QueryInterface(0x9ABDD40D))
-        local get_video_fn = ffi.cast("NvAPI_GetVideoState_t", nvapi.nvapi_QueryInterface(0x0B6EF8B9))
-        local set_video_fn = ffi.cast("NvAPI_SetVideoState_t", nvapi.nvapi_QueryInterface(0x9321CA5B))
-
-        if init_fn == nil or enum_disp_fn == nil or get_video_fn == nil or set_video_fn == nil then
-            return false
-        end
-
-        if init_fn() ~= 0 then
-            return false
-        end
-
-        return {
-            ffi = ffi,
-            enum_disp = enum_disp_fn,
-            get_video = get_video_fn,
-            set_video = set_video_fn,
-        }
-    end)
-
-    if ok and ctx then
-        nvapi_ctx = ctx
-    else
-        nvapi_ctx = false
-        log_verbose("NVAPI interface unavailable: " .. tostring(ctx))
-    end
-
-    return nvapi_ctx
-end
-
-local function enforce_vsr_quality_level(quality_level)
-    if is_headless() then return false end
-    local ctx = init_nvapi()
-    if not ctx then
-        return false
-    end
-
-    local ok, applied_quality = pcall(function()
-        local ffi = ctx.ffi
-        local h_disp = ffi.new("void*[1]")
-        local verified_level = nil
-
-        for disp_idx = 0, 7 do
-            if ctx.enum_disp(disp_idx, h_disp) ~= 0 or h_disp[0] == nil then
-                break
-            end
-
-            -- 1. Disable SuperResolution Auto mode (componentId = 36) so quality stays locked at Level 4
-            local set_auto = ffi.new("uint32_t[16]")
-            set_auto[0] = 0x00010040 -- _NVAPI_SET_VIDEO_STATE_COMPONENT_EX v1 (64 bytes)
-            set_auto[1] = 36         -- componentId = 36 (_User_Global_VAL_SuperResolution_Auto)
-            set_auto[2] = 0          -- deviceIndex = 0 (global)
-            set_auto[3] = 1          -- bIsTopPriority = 1
-            set_auto[4] = 0          -- enable = 0 (Auto OFF)
-            set_auto[5] = 0          -- setToAlgo = 0
-            ctx.set_video(h_disp[0], set_auto)
-
-            -- 2. Enable SuperResolution and set Quality Level 4 (componentId = 29)
-            local set_vsr = ffi.new("uint32_t[16]")
-            set_vsr[0] = 0x00010040  -- _NVAPI_SET_VIDEO_STATE_COMPONENT_EX v1 (64 bytes)
-            set_vsr[1] = 29          -- componentId = 29 (_User_Global_VAL_SuperResolution)
-            set_vsr[2] = 0           -- deviceIndex = 0 (global)
-            set_vsr[3] = 1           -- bIsTopPriority = 1
-            set_vsr[4] = 1           -- enable = 1 (VSR ON)
-            set_vsr[5] = quality_level -- setToAlgo = 4 (Quality Level 4 Ultra)
-            ctx.set_video(h_disp[0], set_vsr)
-
-            -- 3. Read back active driver state to verify Quality Level 4
-            local get_vsr = ffi.new("uint32_t[32]")
-            get_vsr[0] = 0x00010080  -- _NVAPI_GET_VIDEO_STATE_COMPONENT_EX v1 (128 bytes)
-            get_vsr[1] = 29
-            get_vsr[2] = 0
-            if ctx.get_video(h_disp[0], get_vsr) == 0 then
-                verified_level = tonumber(get_vsr[22]) -- offset 0x58 = lastAlgoSet
-            end
-        end
-
-        return verified_level
-    end)
-
-    if ok and applied_quality then
-        state.current_quality = applied_quality
-        if not state.nvapi_quality_enforced then
-            state.nvapi_quality_enforced = true
-            log(string.format("NVAPI: Locked NVIDIA RTX VSR to Quality Level %d (Ultra)", applied_quality))
-        end
-        return true
-    end
-
-    return false
+-- Show clean OSD notification without dumping raw filter chains
+local function show_osd_status(enabled)
+    local msg = enabled and "RTX VSR Enabled" or "RTX VSR Disabled"
+    mp.osd_message(msg, 2)
 end
 
 -- Format scale ratio cleanly (e.g., 2.0, 1.3333, 1.5)
@@ -393,10 +283,11 @@ local function remove_vsr_filter(reason)
     state.active = false
     state.current_scale_str = nil
     state.last_reason = reason or "Bypassed"
+    mp.set_property_bool("user-data/rtx-vsr-active", false)
 end
 
 -- Core evaluation loop
-local function evaluate_vsr(refresh_osd)
+local function evaluate_vsr(user_interactive)
     if state.internal_vf_op or state.profile_resetting or is_headless() then return end
 
     local _, vsr_index, vsr_entry, has_cpu_filter, last_cpu_index = inspect_vf_chain()
@@ -435,13 +326,10 @@ local function evaluate_vsr(refresh_osd)
         return
     end
 
-    -- 6. Ensure NVIDIA driver VSR Quality Level 4 (Ultra) is enforced via NVAPI before activating filter
-    enforce_vsr_quality_level(VSR_TARGET_QUALITY)
-
     local scale_str = format_scale_ratio(ratio)
     local filter_spec = string.format("@%s:d3d11vpp=scaling-mode=nvidia:scale=%s", FILTER_LABEL, scale_str)
 
-    -- 7. Check if @rtx_vsr is already present with the exact scale and positioned after any CPU filters
+    -- 6. Check if @rtx_vsr is already present with the exact scale and positioned after any CPU filters
     local current_scale = vsr_entry and vsr_entry.params and vsr_entry.params.scale
     local needs_reorder = vsr_index and has_cpu_filter and (vsr_index < last_cpu_index)
 
@@ -449,13 +337,11 @@ local function evaluate_vsr(refresh_osd)
         state.active = true
         state.current_scale_str = scale_str
         state.last_reason = desc
-        if refresh_osd then
-            mp.command('show-text "RTX VSR: ${vf}" 3000')
-        end
+        mp.set_property_bool("user-data/rtx-vsr-active", true)
         return
     end
 
-    -- 8. Apply or update @rtx_vsr at the tail of the VF chain
+    -- 7. Apply or update @rtx_vsr at the tail of the VF chain
     state.internal_vf_op = true
     if needs_reorder then
         local vf_list = mp.get_property_native("vf") or {}
@@ -481,16 +367,46 @@ local function evaluate_vsr(refresh_osd)
     state.active = true
     state.current_scale_str = scale_str
     state.last_reason = desc
-    log(string.format("Applied %s [Quality %d Ultra] (%s)", filter_spec, state.current_quality, desc))
-
-    if refresh_osd then
-        mp.command('show-text "RTX VSR: ${vf}" 3000')
-    end
+    mp.set_property_bool("user-data/rtx-vsr-active", true)
+    log(string.format("Applied %s (%s) [Quality: Driver-Managed]", filter_spec, desc))
 end
 
 -- Toggle handler for script-binding / script-message
 local function toggle_vsr()
-    mp.command('vf toggle @rtx_vsr:d3d11vpp=scaling-mode=nvidia ; show-text "RTX VSR: ${vf}" 3000')
+    if is_headless() then return end
+
+    if state.user_enabled and state.active then
+        state.user_enabled = false
+        state.manual_override = false
+        state.force_over_anime4k = false
+        remove_vsr_filter("Toggled off by user")
+        mp.set_property_bool("user-data/rtx-vsr-active", false)
+        mp.set_property_bool("user-data/rtx-vsr-disabled", true)
+        show_osd_status(false)
+        log("RTX VSR toggled OFF by user")
+    else
+        state.user_enabled = true
+        state.manual_override = true
+        mp.set_property_bool("user-data/rtx-vsr-disabled", false)
+        if has_anime4k_upscaler() then
+            state.force_over_anime4k = true
+            clear_anime4k_shaders()
+        end
+        evaluate_vsr(true)
+        if not state.active then
+            -- Fallback direct append if evaluate_vsr didn't activate
+            local _, vsr_index = inspect_vf_chain()
+            if not vsr_index then
+                state.internal_vf_op = true
+                mp.commandv("vf", "append", "@" .. FILTER_LABEL .. ":d3d11vpp=scaling-mode=nvidia")
+                state.internal_vf_op = false
+            end
+            state.active = true
+            mp.set_property_bool("user-data/rtx-vsr-active", true)
+        end
+        show_osd_status(true)
+        log("RTX VSR toggled ON by user")
+    end
 end
 
 -- Observers for video parameters, display bounds, VF chain, and GLSL shaders
@@ -516,25 +432,29 @@ mp.observe_property("vf", "native", function()
     local _, vsr_index, vsr_entry = inspect_vf_chain()
     local vsr_present = (vsr_index ~= nil) and (vsr_entry.enabled ~= false)
 
-    -- Detect direct user toggle via Shift+R (`vf toggle @rtx_vsr:d3d11vpp=scaling-mode=nvidia`)
+    -- Detect direct external toggle (e.g. from external commands)
     if state.active and not vsr_present then
         state.user_enabled = false
         state.manual_override = false
         state.force_over_anime4k = false
         state.active = false
         state.current_scale_str = nil
-        state.last_reason = "Disabled by user"
-        log("Disabled @rtx_vsr via user hotkey toggle")
+        state.last_reason = "Disabled externally"
+        mp.set_property_bool("user-data/rtx-vsr-active", false)
+        mp.set_property_bool("user-data/rtx-vsr-disabled", true)
+        show_osd_status(false)
+        log("Disabled @rtx_vsr via external toggle")
         return
-    elseif vsr_present and (not state.user_enabled or not state.active or not (vsr_entry.params and vsr_entry.params.scale)) then
+    elseif vsr_present and (not state.user_enabled or not state.active) then
         state.user_enabled = true
         state.manual_override = true
-        state.nvapi_quality_enforced = false
+        mp.set_property_bool("user-data/rtx-vsr-disabled", false)
         if has_anime4k_upscaler() then
             state.force_over_anime4k = true
             clear_anime4k_shaders()
         end
-        evaluate_vsr(true)
+        evaluate_vsr(false)
+        show_osd_status(true)
         return
     end
 
@@ -558,9 +478,9 @@ mp.register_event("start-file", function()
     state.current_scale_str = nil
     state.manual_override = false
     state.force_over_anime4k = false
-    state.nvapi_quality_enforced = false
     state.profile_resetting = false
     state.last_reason = "Loading"
+    mp.set_property_bool("user-data/rtx-vsr-active", false)
 end)
 
 -- Coordinate with profile-manager.lua clean-slate resets
@@ -568,6 +488,7 @@ mp.register_script_message("profile-begin", function()
     state.profile_resetting = true
     state.active = false
     state.current_scale_str = nil
+    mp.set_property_bool("user-data/rtx-vsr-active", false)
 end)
 
 mp.register_script_message("profile-end", function()
@@ -577,7 +498,8 @@ end)
 
 -- Register keybind and script messages
 mp.add_key_binding(nil, "toggle-vsr", toggle_vsr)
+mp.register_script_message("toggle-vsr", toggle_vsr)
 mp.register_script_message("toggle-rtx-vsr", toggle_vsr)
 mp.register_script_message("rtx-vsr-toggle", toggle_vsr)
 
-log("Loaded NVIDIA RTX Video Super Resolution controller (Target: Quality Level 4 Ultra)")
+log("Loaded NVIDIA RTX Video Super Resolution controller (Driver-Managed Quality)")

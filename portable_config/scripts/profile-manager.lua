@@ -548,6 +548,50 @@ mp.register_script_message("cycle-audio-preset", function()
 end)
 
 
+-- Check if NVIDIA RTX VSR is currently active or eligible for sub-native upscaling
+local function is_rtx_vsr_active(is_anime_content, anime_shader_preset, content_height)
+    -- 1. Check user-data property published by rtx_vsr.lua
+    local ud = mp.get_property_bool("user-data/rtx-vsr-active")
+    if ud == true then
+        return true
+    end
+
+    -- 2. Check if @rtx_vsr is in the current active VF chain
+    local vf = mp.get_property_native("vf") or {}
+    for _, f in ipairs(vf) do
+        if f.label == "rtx_vsr" and f.enabled ~= false then
+            return true
+        end
+    end
+
+    -- 3. If user explicitly toggled VSR off, respect user preference
+    if mp.get_property_bool("user-data/rtx-vsr-disabled") == true then
+        return false
+    end
+
+    -- 4. Check if video parameters qualify for automatic RTX VSR:
+    -- Sub-native resolution on D3D11 rendering without conflicting Anime4K upscalers
+    local gpu_api = mp.get_property("gpu-api") or "d3d11"
+    if gpu_api == "d3d11" or gpu_api == "auto" then
+        local disp_h = mp.get_property_number("display-height")
+        if not disp_h or disp_h <= 0 then
+            local osd = mp.get_property_native("osd-dimensions")
+            if osd and osd.h and osd.h > 0 then
+                disp_h = osd.h
+            end
+        end
+        local vh = content_height or (state.params_cache and state.params_cache.h) or mp.get_property_number("height") or 0
+        if disp_h and disp_h > 0 and vh > 0 and vh < disp_h then
+            if is_anime_content and anime_shader_preset and anime_shader_preset ~= "none" then
+                return false
+            end
+            return true
+        end
+    end
+
+    return false
+end
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- MAIN EXECUTION LATCH
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -653,6 +697,9 @@ function try_execute_profile()
     end
     if should_run_global_svp then
         table.insert(osd_parts, "SVP")
+    end
+    if is_rtx_vsr_active(is_anime, shader_preset, height) then
+        table.insert(osd_parts, "RTX VSR")
     end
     
     -- APPLY
