@@ -269,11 +269,18 @@ local function apply_sdr_baseline()
     log("Applying SDR baseline (clean slate)")
     
     -- 0. Reset hwdec to safe default (prevents auto-copy from sticking)
-    mp.set_property("hwdec", "auto")
+    mp.set_property("hwdec", "d3d11va")
     
-    -- 1. Reset Rendering Chains (prevents bleed-over without resetting global prefs like volume)
+    -- 1. Reset Rendering Chains (preserve @rtx_vsr and @blackdetect across metadata latch)
     mp.set_property("glsl-shaders", "")   -- Clear all shaders
-    mp.set_property("vf", "")             -- Clear video filters
+    local current_vf = mp.get_property_native("vf") or {}
+    local kept_vf = {}
+    for _, f in ipairs(current_vf) do
+        if f.label == "rtx_vsr" or f.label == "blackdetect" then
+            table.insert(kept_vf, f)
+        end
+    end
+    mp.set_property_native("vf", kept_vf)
     mp.set_property("af", "")             -- Clear audio filters
     
     -- 2. Reset Colorspace to Neutral/Auto
@@ -284,10 +291,10 @@ local function apply_sdr_baseline()
     mp.set_property("tone-mapping", "auto")           -- Reset tone mapping
 end
 
--- Apply SVP sync engine policies (forces hwdec=auto-copy and real-time frame sync settings when active)
+-- Apply SVP sync engine policies (forces hwdec=d3d11va-copy and real-time frame sync settings when active)
 local function apply_svp_sync_policy(active)
     if active then
-        mp.set_property("hwdec", "auto-copy")
+        mp.set_property("hwdec", "d3d11va-copy")
         mp.set_property("hr-seek-framedrop", "no")
         mp.set_property("video-latency-hacks", "yes")
         mp.set_property("mc", "0")
@@ -298,10 +305,10 @@ local function apply_svp_sync_policy(active)
         mp.set_property("vd-queue-max-secs", "60")
         log("SVP Engine Active: applied real-time sync & enlarged queue buffer (1024MiB / 120 samples)")
     else
-        mp.set_property("hwdec", "auto")
+        mp.set_property("hwdec", "d3d11va")
         mp.set_property("hr-seek-framedrop", "yes")
         mp.set_property("video-latency-hacks", "no")
-        mp.set_property("mc", "-1")
+        mp.set_property("mc", "0")
         mp.set_property("autosync", "0")
         mp.set_property("vd-queue-enable", "no")
         log("SVP Engine Inactive: restored default mpv playback baseline")
@@ -626,11 +633,9 @@ function try_execute_profile()
     local should_run_global_svp = not is_anime and svp_enabled and svp_global
 
     if vulkan_mode then
-        log("Vulkan mode enabled")
-        mp.set_property("gpu-api", "vulkan")
-        mp.set_property("vulkan-async-compute", "yes")
-        mp.set_property("vulkan-async-transfer", "yes")
+        log("Vulkan mode requested in metadata; keeping gpu-api=d3d11 for NVIDIA RTX VSR hardware compatibility")
     end
+    mp.set_property("gpu-api", "d3d11")
     
     -- Determine base profile
     local base_profile = is_anime and "anime-sdr" or "sdr"
@@ -709,6 +714,7 @@ function try_execute_profile()
     end
     
     log("Profile applied successfully.")
+    mp.commandv("script-message-to", "rtx_vsr", "profile-end")
 end
 
 

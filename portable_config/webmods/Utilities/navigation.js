@@ -300,6 +300,28 @@
 
           // --- PLAYER OVERLAY CONTROLS (Executes regardless of isGridPage) ---
           if (hash.startsWith("#/player")) {
+            // Forward Shift+R (NVIDIA RTX VSR toggle) directly to mpv and prevent React's 'R' speed menu from intercepting it
+            if (
+              !isTypingInInput &&
+              e.shiftKey &&
+              !e.altKey &&
+              !e.metaKey &&
+              (e.key === "R" || e.key === "r" || e.code === "KeyR")
+            ) {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              window.chrome?.webview?.postMessage(
+                JSON.stringify({
+                  type: 6,
+                  object: "transport",
+                  method: "handleInboundJSON",
+                  args: ["mpv-command", ["keypress", "Shift+R"]],
+                }),
+              );
+              return;
+            }
+
             // Player UI Toggling (Gamepad X / Tab) is handled natively inside `pollGamepad` due to React synthetic event numbness.
 
             // 3. Arrow Keys: Priority-ordered spatial navigation

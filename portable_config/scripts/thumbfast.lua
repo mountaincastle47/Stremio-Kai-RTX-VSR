@@ -68,9 +68,9 @@ function subprocess(args, async, callback)
 
     if not pre_0_30_0 then
         if async then
-            return mp.command_native_async({name = "subprocess", playback_only = true, args = args}, callback)
+            return mp.command_native_async({name = "subprocess", playback_only = true, capture_stdout = true, capture_stderr = true, args = args}, callback)
         else
-            return mp.command_native({name = "subprocess", playback_only = false, capture_stdout = true, args = args})
+            return mp.command_native({name = "subprocess", playback_only = false, capture_stdout = true, capture_stderr = true, args = args})
         end
     else
         if async then
@@ -277,9 +277,40 @@ options.scale_factor = math.floor(options.scale_factor)
 local mpv_path = options.mpv_path
 local frontend_path
 
-if mpv_path == "mpv" and os_name == "windows" then
-    frontend_path = mp.get_property_native("user-data/frontend/process-path")
-    mpv_path = frontend_path or mpv_path
+if os_name == "windows" then
+    local function resolve_windows_mpv_path(configured)
+        local candidates = {}
+        if configured and configured ~= "" and configured ~= "mpv" then
+            if configured:find("^~~") then
+                local expanded = mp.command_native({"expand-path", configured})
+                if expanded and expanded ~= "" then
+                    table.insert(candidates, expanded)
+                end
+            end
+            table.insert(candidates, configured)
+        end
+        local expanded_local = mp.command_native({"expand-path", "~~/mpv/mpv.exe"})
+        if expanded_local and expanded_local ~= "" then
+            table.insert(candidates, expanded_local)
+        end
+        table.insert(candidates, "C:/Stremio Kai/portable_config/mpv/mpv.exe")
+        table.insert(candidates, "C:/Stremio-Kai/portable_config/mpv/mpv.exe")
+        table.insert(candidates, "C:/mpv/mpv.exe")
+
+        for _, candidate in ipairs(candidates) do
+            local info = mp.utils.file_info(candidate)
+            if info and info.is_file then
+                return (candidate:gsub("/", "\\"))
+            end
+        end
+        return configured
+    end
+
+    mpv_path = resolve_windows_mpv_path(mpv_path)
+    if mpv_path == "mpv" then
+        frontend_path = mp.get_property_native("user-data/frontend/process-path")
+        mpv_path = frontend_path or mpv_path
+    end
 end
 
 if mpv_path == "mpv" and os_name == "darwin" and unique then
@@ -463,8 +494,8 @@ local function spawn(time)
         "--edition="..(properties["edition"] or "auto"), "--vid="..(vid or "auto"), "--no-sub", "--no-audio",
         "--start="..time, allow_fast_seek and "--hr-seek=no" or "--hr-seek=yes",
         "--ytdl-format=worst", "--demuxer-readahead-secs=0", "--demuxer-max-bytes=128KiB",
-        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads=2", "--hwdec="..(options.hwdec and "auto" or "no"),
-        "--vf="..vf_string(filters_all, true),
+        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads=2", "--hwdec="..(options.hwdec and "auto-copy" or "no"),
+        "--glsl-shaders-clr", "--vf-clr", "--vf="..vf_string(filters_all, true),
         "--sws-scaler=fast-bilinear",
         "--video-rotate="..last_rotate,
         "--ovc=rawvideo", "--of=image2", "--ofopts=update=1", "--o="..options.thumbnail

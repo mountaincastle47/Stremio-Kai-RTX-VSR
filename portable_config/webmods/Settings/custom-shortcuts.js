@@ -162,6 +162,11 @@
       keys: ["Ctrl", "+", "F12"],
       description: "Combined processing for interlaced content.",
     },
+    {
+      name: "RTX Video Super Resolution",
+      keys: ["Shift", "+", "R"],
+      description: "Toggles NVIDIA RTX VSR hardware upscaling for sub-native streams.",
+    },
 
     // ─── GAMEPAD NAVIGATION ────────────────────────────────────────
     { type: "header", name: "Gamepad — Navigation", icon: "gamepad" },
