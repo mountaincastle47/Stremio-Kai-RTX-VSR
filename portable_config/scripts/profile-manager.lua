@@ -263,6 +263,56 @@ end
 -- DYNAMIC LAYER HELPER FUNCTIONS
 -- ═══════════════════════════════════════════════════════════════════════════
 
+-- Helper to read persistent RTX VSR state directly (~~/rtx_vsr_state.txt)
+local function read_rtx_vsr_persisted_state()
+    local path = mp.command_native({"expand-path", "~~/rtx_vsr_state.txt"})
+    if not path or path == "" then return false end
+    local f = io.open(path, "r")
+    if not f then return false end
+    local content = f:read("*a")
+    f:close()
+    if not content then return false end
+    content = content:gsub("%s+", "")
+    return content == "1"
+end
+
+-- Check if NVIDIA RTX VSR is currently active or enabled by persisted state
+local function is_rtx_vsr_active(is_anime_content, anime_shader_preset, content_height)
+    local vo = mp.get_property("vo") or ""
+    if vo == "null" or vo == "image" then return false end
+
+    -- 1. Check user-data property if already published by rtx_vsr.lua
+    local ud_active = mp.get_property_bool("user-data/rtx-vsr-active")
+    if ud_active == true then
+        return true
+    end
+
+    -- 2. Check if @rtx_vsr is in the current active VF chain
+    local vf = mp.get_property_native("vf") or {}
+    for _, f in ipairs(vf) do
+        if f.label == "rtx_vsr" and f.enabled ~= false then
+            return true
+        end
+    end
+
+    -- 3. Check persisted state from user-data or state file
+    local persisted_enabled = mp.get_property_bool("user-data/rtx-vsr-persisted-enabled")
+    if persisted_enabled == nil then
+        persisted_enabled = read_rtx_vsr_persisted_state()
+    end
+
+    if not persisted_enabled then
+        return false
+    end
+
+    -- If anime content has active shaders, RTX VSR yields by default
+    if is_anime_content and anime_shader_preset and anime_shader_preset ~= "none" then
+        return false
+    end
+
+    return true
+end
+
 -- Apply SDR baseline settings (safe defaults for SDR content or as a reset)
 -- Called at the START of every profile application to ensure clean slate
 local function apply_sdr_baseline()
@@ -271,12 +321,13 @@ local function apply_sdr_baseline()
     -- 0. Reset hwdec to safe default (prevents auto-copy from sticking)
     mp.set_property("hwdec", "d3d11va")
     
-    -- 1. Reset Rendering Chains (preserve @rtx_vsr and @blackdetect across metadata latch)
+    -- 1. Reset Rendering Chains (preserve @rtx_vsr if persisted state enabled, and @blackdetect across metadata latch)
     mp.set_property("glsl-shaders", "")   -- Clear all shaders
     local current_vf = mp.get_property_native("vf") or {}
+    local vsr_enabled = is_rtx_vsr_active(false, nil, nil)
     local kept_vf = {}
     for _, f in ipairs(current_vf) do
-        if f.label == "rtx_vsr" or f.label == "blackdetect" then
+        if (f.label == "rtx_vsr" and vsr_enabled) or f.label == "blackdetect" then
             table.insert(kept_vf, f)
         end
     end
@@ -547,50 +598,6 @@ mp.register_script_message("cycle-audio-preset", function()
     log("[Audio] Cycled to: " .. name)
 end)
 
-
--- Check if NVIDIA RTX VSR is currently active or eligible for sub-native upscaling
-local function is_rtx_vsr_active(is_anime_content, anime_shader_preset, content_height)
-    -- 1. Check user-data property published by rtx_vsr.lua
-    local ud = mp.get_property_bool("user-data/rtx-vsr-active")
-    if ud == true then
-        return true
-    end
-
-    -- 2. Check if @rtx_vsr is in the current active VF chain
-    local vf = mp.get_property_native("vf") or {}
-    for _, f in ipairs(vf) do
-        if f.label == "rtx_vsr" and f.enabled ~= false then
-            return true
-        end
-    end
-
-    -- 3. If user explicitly toggled VSR off, respect user preference
-    if mp.get_property_bool("user-data/rtx-vsr-disabled") == true then
-        return false
-    end
-
-    -- 4. Check if video parameters qualify for automatic RTX VSR:
-    -- Sub-native resolution on D3D11 rendering without conflicting Anime4K upscalers
-    local gpu_api = mp.get_property("gpu-api") or "d3d11"
-    if gpu_api == "d3d11" or gpu_api == "auto" then
-        local disp_h = mp.get_property_number("display-height")
-        if not disp_h or disp_h <= 0 then
-            local osd = mp.get_property_native("osd-dimensions")
-            if osd and osd.h and osd.h > 0 then
-                disp_h = osd.h
-            end
-        end
-        local vh = content_height or (state.params_cache and state.params_cache.h) or mp.get_property_number("height") or 0
-        if disp_h and disp_h > 0 and vh > 0 and vh < disp_h then
-            if is_anime_content and anime_shader_preset and anime_shader_preset ~= "none" then
-                return false
-            end
-            return true
-        end
-    end
-
-    return false
-end
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- MAIN EXECUTION LATCH

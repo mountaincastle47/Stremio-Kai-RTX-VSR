@@ -1,9 +1,9 @@
 --[[
   @name NVIDIA RTX Video Super Resolution (VSR)
   @description Dynamically manages native D3D11 NVIDIA RTX Video Super Resolution (@rtx_vsr:d3d11vpp=scaling-mode=nvidia)
-               for sub-native streams with quality controlled natively by the NVIDIA driver (Control Panel / NVIDIA App)
-               while preserving aspect ratios and coordinating with Shift+R clean OSD toggle, Anime4K shaders, SVP, and CPU filters.
-  @version 1.3
+               with persistent state storage across stream restarts (~~/rtx_vsr_state.txt), clean OSD toggles,
+               and aspect-ratio-safe sub-native hardware upscaling.
+  @version 1.4
   @author Stremio-Kai
 --]]
 -- luacheck: read globals mp
@@ -13,7 +13,7 @@ local mp = require("mp")
 local FILTER_LABEL = "rtx_vsr"
 
 local state = {
-    user_enabled = true,
+    user_enabled = false,
     manual_override = false,
     force_over_anime4k = false,
     active = false,
@@ -38,10 +38,49 @@ local function is_headless()
     local vo = mp.get_property("vo") or ""
     local ovc = mp.get_property("ovc") or ""
     local vid = mp.get_property("vid") or ""
-    if vo == "null" or vo == "image" or ovc ~= "" or vid == "no" then
+    local video = mp.get_property("video") or ""
+    if vo == "null" or vo == "image" or ovc ~= "" or vid == "no" or video == "no" then
         return true
     end
     return false
+end
+
+-- Resolve persistent state file path (~~/rtx_vsr_state.txt)
+local state_file_path = nil
+local function get_state_file_path()
+    if not state_file_path then
+        state_file_path = mp.command_native({"expand-path", "~~/rtx_vsr_state.txt"})
+    end
+    return state_file_path
+end
+
+-- Read persisted state from disk ("1" = enabled, "0"/missing = disabled)
+local function read_persisted_state()
+    if is_headless() then return false end
+    local path = get_state_file_path()
+    if not path or path == "" then return false end
+    local f = io.open(path, "r")
+    if not f then return false end
+    local content = f:read("*a")
+    f:close()
+    if not content then return false end
+    content = content:gsub("%s+", "")
+    return content == "1"
+end
+
+-- Write persisted state to disk
+local function write_persisted_state(enabled)
+    if is_headless() then return end
+    local path = get_state_file_path()
+    if not path or path == "" then return end
+    local f, err = io.open(path, "w")
+    if f then
+        f:write(enabled and "1" or "0")
+        f:close()
+        log_verbose("Persisted state written: " .. (enabled and "1" or "0") .. " to " .. path)
+    else
+        mp.msg.warn("[rtx-vsr] Failed to write state file: " .. tostring(err))
+    end
 end
 
 -- Show clean OSD notification without dumping raw filter chains
@@ -166,7 +205,6 @@ end
 
 -- Compute VSR scale ratio while handling letterboxed / wide aspect ratios without stretching
 local function calculate_vsr_scale(video, disp_w, disp_h, allow_manual_fallback)
-    -- Ensure mpv preserves aspect ratio so letterboxed streams are never stretched
     if mp.get_property_bool("keepaspect") == false then
         mp.set_property_bool("keepaspect", true)
     end
@@ -176,7 +214,7 @@ local function calculate_vsr_scale(video, disp_w, disp_h, allow_manual_fallback)
     local dar_w = video.dw
     local dar_h = video.dh
 
-    -- Bypass if video height or display-aspect width matches or exceeds monitor bounds (unless manually forced via Shift+R)
+    -- Bypass if video height or display-aspect width matches or exceeds monitor bounds
     if vh >= disp_h or vw >= disp_w or dar_h >= disp_h or dar_w >= disp_w then
         if allow_manual_fallback and vh < 2160 then
             local manual_ratio = (vh <= 1080) and (1440 / vh) or 1.5
@@ -273,6 +311,7 @@ end
 
 -- Remove @rtx_vsr from the VF chain if present
 local function remove_vsr_filter(reason)
+    if is_headless() then return end
     local _, vsr_index = inspect_vf_chain()
     if vsr_index then
         state.internal_vf_op = true
@@ -286,65 +325,28 @@ local function remove_vsr_filter(reason)
     mp.set_property_bool("user-data/rtx-vsr-active", false)
 end
 
--- Core evaluation loop
-local function evaluate_vsr(user_interactive)
-    if state.internal_vf_op or state.profile_resetting or is_headless() then return end
+-- Engage @rtx_vsr in the VF chain at the tail (after CPU filters) without duplication
+local function engage_vsr_filter(scale_str)
+    if is_headless() then return end
+    local filter_spec = (scale_str and scale_str ~= "")
+        and string.format("@%s:d3d11vpp=scaling-mode=nvidia:scale=%s", FILTER_LABEL, scale_str)
+        or string.format("@%s:d3d11vpp=scaling-mode=nvidia", FILTER_LABEL)
 
-    local _, vsr_index, vsr_entry, has_cpu_filter, last_cpu_index = inspect_vf_chain()
+    local vf_list, vsr_index, vsr_entry, has_cpu_filter, last_cpu_index = inspect_vf_chain()
     sync_hwdec_for_vf(has_cpu_filter)
 
-    -- 1. Check user toggle state
-    if not state.user_enabled then
-        remove_vsr_filter("Disabled by user")
-        return
-    end
-
-    -- 2. Ensure GPU API is d3d11 (d3d11vpp requires gpu-api=d3d11)
-    local gpu_api = mp.get_property("gpu-api") or "auto"
-    if gpu_api ~= "d3d11" and gpu_api ~= "auto" then
-        mp.set_property("gpu-api", "d3d11")
-    end
-
-    -- 3. Check Anime4K shader compatibility
-    if has_anime4k_upscaler() and not state.force_over_anime4k then
-        remove_vsr_filter("Yielding to active Anime4K shaders")
-        return
-    end
-
-    -- 4. Check video parameters and display bounds
-    local video = get_video_bounds()
-    local disp_w, disp_h = get_display_bounds()
-    if not video or not disp_w or not disp_h then
-        log_verbose("Waiting for video parameters and display bounds...")
-        return
-    end
-
-    -- 5. Calculate vertical scale ratio (with letterbox protection)
-    local ratio, desc = calculate_vsr_scale(video, disp_w, disp_h, state.manual_override)
-    if not ratio then
-        remove_vsr_filter(desc)
-        return
-    end
-
-    local scale_str = format_scale_ratio(ratio)
-    local filter_spec = string.format("@%s:d3d11vpp=scaling-mode=nvidia:scale=%s", FILTER_LABEL, scale_str)
-
-    -- 6. Check if @rtx_vsr is already present with the exact scale and positioned after any CPU filters
-    local current_scale = vsr_entry and vsr_entry.params and vsr_entry.params.scale
     local needs_reorder = vsr_index and has_cpu_filter and (vsr_index < last_cpu_index)
+    local current_scale = vsr_entry and vsr_entry.params and vsr_entry.params.scale
 
-    if vsr_index and current_scale == scale_str and not needs_reorder and vsr_entry.enabled ~= false then
+    if vsr_index and not needs_reorder and current_scale == scale_str and vsr_entry.enabled ~= false then
         state.active = true
         state.current_scale_str = scale_str
-        state.last_reason = desc
         mp.set_property_bool("user-data/rtx-vsr-active", true)
         return
     end
 
-    -- 7. Apply or update @rtx_vsr at the tail of the VF chain
     state.internal_vf_op = true
     if needs_reorder then
-        local vf_list = mp.get_property_native("vf") or {}
         local reordered = {}
         for i, f in ipairs(vf_list) do
             if f.label ~= FILTER_LABEL then
@@ -366,46 +368,85 @@ local function evaluate_vsr(user_interactive)
 
     state.active = true
     state.current_scale_str = scale_str
-    state.last_reason = desc
     mp.set_property_bool("user-data/rtx-vsr-active", true)
-    log(string.format("Applied %s (%s) [Quality: Driver-Managed]", filter_spec, desc))
+    log(string.format("Engaged %s [Quality: Driver-Managed]", filter_spec))
 end
 
--- Toggle handler for script-binding / script-message
+-- Core evaluation loop
+local function evaluate_vsr(user_interactive)
+    if state.internal_vf_op or state.profile_resetting or is_headless() then return end
+
+    -- 1. Check user toggle state
+    if not state.user_enabled then
+        remove_vsr_filter("Disabled by persisted state")
+        return
+    end
+
+    -- 2. Ensure GPU API is d3d11
+    local gpu_api = mp.get_property("gpu-api") or "auto"
+    if gpu_api ~= "d3d11" and gpu_api ~= "auto" then
+        mp.set_property("gpu-api", "d3d11")
+    end
+
+    -- 3. Check Anime4K shader compatibility
+    if has_anime4k_upscaler() and not state.force_over_anime4k then
+        remove_vsr_filter("Yielding to active Anime4K shaders")
+        return
+    end
+
+    -- 4. Check video parameters and display bounds
+    local video = get_video_bounds()
+    local disp_w, disp_h = get_display_bounds()
+    if not video or not disp_w or not disp_h then
+        -- Bounds not ready yet; attach baseline filter so VSR is active
+        engage_vsr_filter(nil)
+        log_verbose("Attached baseline filter while waiting for display bounds")
+        return
+    end
+
+    -- 5. Calculate vertical scale ratio (with letterbox protection)
+    local ratio, desc = calculate_vsr_scale(video, disp_w, disp_h, state.manual_override)
+    if not ratio then
+        remove_vsr_filter(desc)
+        return
+    end
+
+    local scale_str = format_scale_ratio(ratio)
+    state.last_reason = desc
+    engage_vsr_filter(scale_str)
+end
+
+-- Toggle handler for script-binding / script-message (Shift+R)
 local function toggle_vsr()
     if is_headless() then return end
 
     if state.user_enabled and state.active then
+        -- Toggle OFF
         state.user_enabled = false
         state.manual_override = false
         state.force_over_anime4k = false
+        write_persisted_state(false)
         remove_vsr_filter("Toggled off by user")
         mp.set_property_bool("user-data/rtx-vsr-active", false)
-        mp.set_property_bool("user-data/rtx-vsr-disabled", true)
+        mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", false)
         show_osd_status(false)
-        log("RTX VSR toggled OFF by user")
+        log("RTX VSR toggled OFF by user (state saved: 0)")
     else
+        -- Toggle ON
         state.user_enabled = true
         state.manual_override = true
-        mp.set_property_bool("user-data/rtx-vsr-disabled", false)
+        write_persisted_state(true)
+        mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", true)
         if has_anime4k_upscaler() then
             state.force_over_anime4k = true
             clear_anime4k_shaders()
         end
         evaluate_vsr(true)
         if not state.active then
-            -- Fallback direct append if evaluate_vsr didn't activate
-            local _, vsr_index = inspect_vf_chain()
-            if not vsr_index then
-                state.internal_vf_op = true
-                mp.commandv("vf", "append", "@" .. FILTER_LABEL .. ":d3d11vpp=scaling-mode=nvidia")
-                state.internal_vf_op = false
-            end
-            state.active = true
-            mp.set_property_bool("user-data/rtx-vsr-active", true)
+            engage_vsr_filter(nil)
         end
         show_osd_status(true)
-        log("RTX VSR toggled ON by user")
+        log("RTX VSR toggled ON by user (state saved: 1)")
     end
 end
 
@@ -440,21 +481,24 @@ mp.observe_property("vf", "native", function()
         state.active = false
         state.current_scale_str = nil
         state.last_reason = "Disabled externally"
+        write_persisted_state(false)
         mp.set_property_bool("user-data/rtx-vsr-active", false)
-        mp.set_property_bool("user-data/rtx-vsr-disabled", true)
+        mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", false)
         show_osd_status(false)
-        log("Disabled @rtx_vsr via external toggle")
+        log("Disabled @rtx_vsr via external toggle (state saved: 0)")
         return
     elseif vsr_present and (not state.user_enabled or not state.active) then
         state.user_enabled = true
         state.manual_override = true
-        mp.set_property_bool("user-data/rtx-vsr-disabled", false)
+        write_persisted_state(true)
+        mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", true)
         if has_anime4k_upscaler() then
             state.force_over_anime4k = true
             clear_anime4k_shaders()
         end
         evaluate_vsr(false)
         show_osd_status(true)
+        log("Enabled @rtx_vsr via external toggle (state saved: 1)")
         return
     end
 
@@ -464,7 +508,6 @@ end)
 mp.observe_property("glsl-shaders", "native", function()
     if state.internal_shader_op or state.profile_resetting or is_headless() then return end
     local has_a4k = has_anime4k_upscaler()
-    -- If Anime4K shaders were just toggled ON by the user or profile-manager, yield to Anime4K
     if has_a4k and not state.last_shader_had_anime4k then
         state.force_over_anime4k = false
         state.manual_override = false
@@ -473,27 +516,52 @@ mp.observe_property("glsl-shaders", "native", function()
     evaluate_vsr(false)
 end)
 
-mp.register_event("start-file", function()
+-- Stream Initialization: read persisted state and set initial flags
+local function on_start_file()
+    if is_headless() then return end
+    local enabled = read_persisted_state()
+    state.user_enabled = enabled
     state.active = false
     state.current_scale_str = nil
     state.manual_override = false
     state.force_over_anime4k = false
     state.profile_resetting = false
     state.last_reason = "Loading"
+    mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", enabled)
     mp.set_property_bool("user-data/rtx-vsr-active", false)
-end)
+    log_verbose("start-file initialized: persisted state = " .. (enabled and "1" or "0"))
+end
+
+local function on_file_loaded()
+    if is_headless() then return end
+    local enabled = read_persisted_state()
+    state.user_enabled = enabled
+    mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", enabled)
+    if enabled then
+        engage_vsr_filter(nil)
+        evaluate_vsr(false)
+    else
+        remove_vsr_filter("Persisted state disabled on stream start")
+    end
+    log("Stream loaded: RTX VSR " .. (enabled and "Engaged (State: 1)" or "Unloaded (State: 0)"))
+end
+
+mp.register_event("start-file", on_start_file)
+mp.register_event("file-loaded", on_file_loaded)
 
 -- Coordinate with profile-manager.lua clean-slate resets
 mp.register_script_message("profile-begin", function()
     state.profile_resetting = true
-    state.active = false
-    state.current_scale_str = nil
-    mp.set_property_bool("user-data/rtx-vsr-active", false)
 end)
 
 mp.register_script_message("profile-end", function()
     state.profile_resetting = false
-    evaluate_vsr(false)
+    if state.user_enabled then
+        engage_vsr_filter(state.current_scale_str)
+        evaluate_vsr(false)
+    else
+        remove_vsr_filter("State disabled")
+    end
 end)
 
 -- Register keybind and script messages
@@ -502,4 +570,10 @@ mp.register_script_message("toggle-vsr", toggle_vsr)
 mp.register_script_message("toggle-rtx-vsr", toggle_vsr)
 mp.register_script_message("rtx-vsr-toggle", toggle_vsr)
 
-log("Loaded NVIDIA RTX Video Super Resolution controller (Driver-Managed Quality)")
+-- Initialize on script load
+local initial_enabled = read_persisted_state()
+state.user_enabled = initial_enabled
+mp.set_property_bool("user-data/rtx-vsr-persisted-enabled", initial_enabled)
+mp.set_property_bool("user-data/rtx-vsr-active", false)
+
+log(string.format("Loaded NVIDIA RTX Video Super Resolution controller (Persisted State: %s)", initial_enabled and "1 (Enabled)" or "0 (Disabled)"))
